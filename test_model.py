@@ -182,7 +182,7 @@ def main():
     val_dataloader = DataLoader(val_dataset, shuffle=False, **common)
 
     log.info("creating the model")
-    model = GPT(train_dataset.vocab_size, args.block_size, n_layer=8, n_head=16, n_embd=256)
+    model = GPT(train_dataset.vocab_size, args.block_size, n_layer=8, n_head=8, n_embd=256)
 
     log.info("preparing the learning rate schedule")
     iter_tokens = args.batch_size * args.block_size  # number of tokens backpropped in one iteration
@@ -205,7 +205,7 @@ def main():
 
     log.info("sampling:")
     # context = "anarchism originated as a term of"
-    context = "Romeo and Jul"
+    context = "O God, O God!"
     x = torch.tensor([train_dataset.stoi[s] for s in context], dtype=torch.long)[None, ...]
     if next(model.parameters()).is_cuda:
         x = x.cuda()
