@@ -9,7 +9,8 @@ GPT model:
 
 import math
 import logging
-from typing import List, Set, Dict, Tuple, Optional
+from collections import defaultdict
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,8 @@ if int(os.environ.get('USE_LIGHTNING', 0)):
 else:
     import mingpt.fake_lightning as pl
 # -----------------------------------------------------------------------------
+
+from mingpt.constants import NEPTUNE_RUN
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +49,15 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.proj = nn.Linear(n_embd, n_embd)
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size))
-                                     .view(1, 1, block_size, block_size))
+        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
 
     def forward(self, x, layer_past=None):
-        B, T, C = x.size()
+        B, T, C = x.size()  # 64, 128, 256, Channels = token+pos embedding size
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = self.key(x).view(  B, T, self.n_head, C // self.n_head).transpose(1, 2) # (64, 8, 128, 32)
+        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,  nh, T,  hs)
+        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,  nh, T,  hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -108,6 +110,7 @@ class GPT(pl.LightningModule):
                  attn_pdrop: float = 0.1, # \in [0,1]: amount of dropout on the attention matrix
                  ):
         super().__init__()
+        self.vocab_size = vocab_size
 
         # save these for optimizer init later
         self.learning_rate = learning_rate
@@ -122,10 +125,15 @@ class GPT(pl.LightningModule):
         self.blocks = nn.Sequential(*[Block(n_embd, block_size, n_head, attn_pdrop, resid_pdrop) for _ in range(n_layer)])
         # decoder: at the end one more layernorm and decode the answers
         self.ln_f = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, vocab_size, bias=False) # no need for extra bias due to one in ln_f
+        self.logit_p_head = nn.Linear(n_embd, vocab_size, bias=False)  # no need for extra bias due to one in ln_f
+        self.deviation_head = nn.Linear(n_embd, vocab_size, bias=False)  # mean deviation
 
         self.block_size = block_size
         self.apply(self._init_weights)
+
+        self.iter = 0
+        self.trajectory_counts: Dict[Tuple[int], int] = defaultdict(int)
+        self.max_trajectory_count = 0
 
         logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
 
@@ -202,14 +210,36 @@ class GPT(pl.LightningModule):
         x = self.drop(token_embeddings + position_embeddings)
         x = self.blocks(x)
         x = self.ln_f(x)
-        logits = self.head(x)
+        logits = self.logit_p_head(x)
+        expected_deviation = self.deviation_head(x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
 
-        return logits
+        NEPTUNE_RUN['train/expected_deviation_median'].log(torch.quantile(expected_deviation, 0.5))
+        NEPTUNE_RUN['train/expected_deviation_90pct'].log(torch.quantile(expected_deviation, 0.9))
+        NEPTUNE_RUN['train/expected_deviation_95pct'].log(torch.quantile(expected_deviation, 0.95))
+        NEPTUNE_RUN['train/expected_deviation_99pct'].log(torch.quantile(expected_deviation, 0.99))
+        NEPTUNE_RUN['train/expected_deviation_mean'].log(expected_deviation.mean())
+        NEPTUNE_RUN['train/expected_deviation_max'].log(expected_deviation.max())
+        NEPTUNE_RUN['train/expected_deviation_min'].log(expected_deviation.min())
+        NEPTUNE_RUN['train/logits_std'].log(logits.std())
+
+        return logits, expected_deviation
 
     def step_(self, split, batch, batch_idx=None):
         idx, targets = batch
-        logits = self(idx)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        logits, expected_deviation = self(idx)
+
+        # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
+        one_hot = F.one_hot(targets, num_classes=self.vocab_size)
+        probs = F.softmax(logits, dim=-1)
+        NEPTUNE_RUN['train/probs_std'].log(probs.std())
+        p_diff = (one_hot - probs).abs()  # actual deviation
+        d_diff = p_diff - expected_deviation
+        d_loss = d_diff.square().sum() / d_diff.numel()
+
+        p_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        loss = d_loss + p_loss
+
         return {'loss': loss}
 
     def training_step(self, *args, **kwargs):

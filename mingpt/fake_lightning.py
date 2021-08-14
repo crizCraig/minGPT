@@ -7,15 +7,16 @@ Intentionally made to have the same API as PyTorch Lightning, giving two benefit
 
 import os
 import math
-import logging
 
 from tqdm import tqdm
 import torch
 import torch.nn as nn
 
-logger = logging.getLogger(__name__)
+from loguru import logger as log
 
 # -----------------------------------------------------------------------------
+from mingpt.constants import SAVE_DIR, CHECKPOINT_NAME
+
 
 class LightningModule(nn.Module):
     pass
@@ -32,7 +33,7 @@ very basic Trainer class that will only train the model on up to one GPU.
 
 class Trainer:
 
-    def __init__(self, max_epochs, gpus=0, gradient_clip_val=None, default_root_dir='.', callbacks=None,
+    def __init__(self, max_epochs, gpus=0, gradient_clip_val=None, default_root_dir=SAVE_DIR, callbacks=None,
                  precision=32, **kwargs):
         self.gpus = gpus
         self.max_epochs = max_epochs
@@ -41,23 +42,23 @@ class Trainer:
         self.model = None
 
         if default_root_dir is not None:
-            os.makedirs(default_root_dir, exist_ok = True)
+            os.makedirs(default_root_dir, exist_ok=True)
             self.default_root_dir = default_root_dir
 
         if self.gpus > 1:
-            logger.error("This simple Trainer does not support > 1 GPUs, will just use one.")
+            log.error("This simple Trainer does not support > 1 GPUs, will just use one.")
 
         if precision != 32:
-            logger.error("This simple Trainer does not support non-fp32 precision, will use fp32")
+            log.error("This simple Trainer does not support non-fp32 precision, will use fp32")
 
     def save_checkpoint(self):
-        ckpt_path = os.path.join(self.default_root_dir, 'model.pt')
-        logger.info("saving model checkpoint to %s", ckpt_path)
+        ckpt_path = os.path.join(self.default_root_dir, CHECKPOINT_NAME)
+        log.info("saving model checkpoint to %s" % ckpt_path)
         torch.save(self.model.state_dict(), ckpt_path)
 
     def load_checkpoint(self):
-        ckpt_path = os.path.join(self.default_root_dir, 'model.pt')
-        logger.info("loading model from %s", ckpt_path)
+        ckpt_path = os.path.join(self.default_root_dir, CHECKPOINT_NAME)
+        log.info("loading model from %s" % ckpt_path)
         state_dict = torch.load(ckpt_path)
         self.model.load_state_dict(state_dict)
 
@@ -79,7 +80,7 @@ class Trainer:
                 losses.append(result['loss'].item())
         mean_loss = torch.mean(torch.tensor(losses)).item()
 
-        logger.info("%s loss: %f", split, mean_loss)
+        log.info("%s loss: %f" % (split, mean_loss))
         return mean_loss
 
     def test(self, test_dataloaders): # note we expect a list of dataloaders here
@@ -96,7 +97,7 @@ class Trainer:
         # ship model to gpu if possible
         use_gpu = self.gpus > 0 and torch.cuda.is_available()
         if use_gpu:
-            logger.info("found CUDA device, shipping model to GPU")
+            log.info("found CUDA device, shipping model to GPU")
             self.model.cuda()
 
         # prepare the optimizer
@@ -140,11 +141,14 @@ class Trainer:
 
                 # report progress
                 lr = optimizer.param_groups[0]['lr']
-                pbar.set_description(f"epoch {epoch+1} iter {it}: train loss {loss.item():.5f}. lr {lr:e}")
+                # pbar.set_description(f"epoch {epoch+1} iter {it}: train loss {loss.item():.5f}. lr {lr:e}")
+                log.info(f"epoch {epoch+1} iter {it}: train loss {loss.item():.5f}. lr {lr:e}")
 
             # calculate the current validation loss and checkpoint the model for early stopping
             if val_dataloader is not None:
                 val_loss = self.val(val_dataloader)
+                log.info(f"validation loss {val_loss}")
                 if (self.default_root_dir is not None) and (val_loss < best_val_loss):
                     best_val_loss = val_loss
+                    log.info(f"new best validation loss ^^")
                     self.save_checkpoint()

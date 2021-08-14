@@ -23,7 +23,7 @@ class WarmupCosineLearningRateDecay(pl.Callback):
         # state in this class, will count number of tokens processed so far
         self.tokens = 0
 
-    def on_train_batch_end(self, trainer, pl_module, batch, batch_idx=None, dataloader_idx=None):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx=None, dataloader_idx=None):
         _, y = batch
         self.tokens += (y >= 0).sum()  # y == -100 is "ignore", so don't count these
         if self.tokens < self.warmup_tokens:

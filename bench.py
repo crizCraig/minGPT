@@ -182,7 +182,7 @@ def main():
     val_dataloader = DataLoader(val_dataset, shuffle=False, **common)
 
     log.info("creating the model")
-    model = GPT(train_dataset.vocab_size, args.block_size, n_layer=8, n_head=16, n_embd=256)
+    model = GPT(train_dataset.vocab_size, args.block_size, n_layer=8, n_head=8, n_embd=256)
 
     log.info("preparing the learning rate schedule")
     iter_tokens = args.batch_size * args.block_size  # number of tokens backpropped in one iteration
@@ -194,7 +194,10 @@ def main():
     t0 = time.time()
     log.info("training...")
     trainer = pl.Trainer(gpus=args.num_gpus, max_epochs=args.num_epochs, gradient_clip_val=1.0, callbacks=[lr_decay],
-                         precision=args.precision, default_root_dir=args.default_root_dir)
+                         precision=args.precision, default_root_dir=args.default_root_dir,
+                         # profiler='pytorch',
+                         # max_steps=10
+                         )
     trainer.fit(model, train_dataloader, val_dataloader)
     t1 = time.time()
     log.info("%d epochs took %fs, or %fs/epoch" % (args.num_epochs, t1 - t0, (t1 - t0) / args.num_epochs))
