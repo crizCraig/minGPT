@@ -26,7 +26,7 @@ else:
 
 from mingpt.constants import NEPTUNE_RUN
 
-logger = logging.getLogger(__name__)
+from loguru import logger as log
 
 class CausalSelfAttention(nn.Module):
     """
@@ -35,21 +35,22 @@ class CausalSelfAttention(nn.Module):
     explicit implementation here to show that there is nothing too scary here.
     """
 
-    def __init__(self, n_embd, block_size, n_head, attn_pdrop, resid_pdrop):
+    def __init__(self, embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop):
         super().__init__()
-        assert n_embd % n_head == 0
+        assert embedding_dim % n_head == 0
         self.n_head = n_head
         # key, query, value projections for all heads
-        self.key = nn.Linear(n_embd, n_embd)
-        self.query = nn.Linear(n_embd, n_embd)
-        self.value = nn.Linear(n_embd, n_embd)
+        self.key = nn.Linear(embedding_dim, embedding_dim)
+        self.query = nn.Linear(embedding_dim, embedding_dim)
+        self.value = nn.Linear(embedding_dim, embedding_dim)
         # regularization
         self.attn_drop = nn.Dropout(attn_pdrop)
         self.resid_drop = nn.Dropout(resid_pdrop)
         # output projection
-        self.proj = nn.Linear(n_embd, n_embd)
+        self.proj = nn.Linear(embedding_dim, embedding_dim)
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size))
+                                     .view(1, 1, block_size, block_size))
 
     def forward(self, x, layer_past=None):
         B, T, C = x.size()  # 64, 128, 256, Channels = token+pos embedding size
@@ -74,21 +75,28 @@ class CausalSelfAttention(nn.Module):
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
-    def __init__(self, n_embd, block_size, n_head, attn_pdrop, resid_pdrop):
+    def __init__(self, embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop, out_embedding_dim=None):
         super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, block_size, n_head, attn_pdrop, resid_pdrop)
+        self.ln1 = nn.LayerNorm(embedding_dim)
+        self.ln2 = nn.LayerNorm(embedding_dim)
+        self.attn = CausalSelfAttention(embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop)
         self.mlp = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
+            nn.Linear(embedding_dim, 4 * embedding_dim),
             nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(resid_pdrop),
+            nn.Linear(4 * embedding_dim, embedding_dim),
+            nn.Dropout(resid_pdrop),  # TODO: Ask Eleuther why this is done
         )
+        if out_embedding_dim != embedding_dim:
+            self.out_proj = nn.Linear(embedding_dim, out_embedding_dim)
+        else:
+            self.out_proj = None
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
+        if self.out_proj is not None:
+            # We could do cross attention as in perceiver IO, but this seems simpler ¯\_(ツ)_/¯
+            x = self.out_proj(x)
         return x
 
 class GPT(pl.LightningModule):
@@ -96,18 +104,19 @@ class GPT(pl.LightningModule):
 
     def __init__(self,
                  # model definition args
-                 vocab_size: int, # size of the vocabulary (number of possible tokens)
-                 block_size: int, # length of the model's context window in time
-                 n_layer: int, # depth of the model; number of Transformer blocks in sequence
-                 n_embd: int, # the "width" of the model, number of channels in each Transformer
-                 n_head: int, # number of heads in each multi-head attention inside each Transformer block
+                 vocab_size: int,  # size of the vocabulary (number of possible tokens)
+                 block_size: int,  # length of the model's context window in time
+                 n_layer: int,  # depth of the model; number of Transformer blocks in sequence
+                 embedding_dim: int,  # the "width" of the model, number of channels in each Transformer
+                 n_head: int,  # number of heads in each multi-head attention inside each Transformer block
                  # model optimization args
-                 learning_rate: float = 3e-4, # the base learning rate of the model
-                 weight_decay: float = 0.1, # amount of regularizing L2 weight decay on MatMul ops
-                 betas: Tuple[float, float] = (0.9, 0.95), # momentum terms (betas) for the Adam optimizer
-                 embd_pdrop: float = 0.1, # \in [0,1]: amount of dropout on input embeddings
-                 resid_pdrop: float = 0.1, # \in [0,1]: amount of dropout in each residual connection
-                 attn_pdrop: float = 0.1, # \in [0,1]: amount of dropout on the attention matrix
+                 learning_rate: float = 3e-4,  # the base learning rate of the model
+                 weight_decay: float = 0.1,  # amount of regularizing L2 weight decay on MatMul ops
+                 betas: Tuple[float, float] = (0.9, 0.95),  # momentum terms (betas) for the Adam optimizer
+                 embd_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on input embeddings
+                 resid_pdrop: float = 0.1,  # \in [0,1]: amount of dropout in each residual connection
+                 attn_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on the attention matrix
+                 input_embed: bool = False,  # whether to use embeddings or indexes as input to first layer
                  ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -118,15 +127,17 @@ class GPT(pl.LightningModule):
         self.betas = betas
 
         # input embedding stem: drop(content + position)
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
-        self.pos_emb = nn.Parameter(torch.zeros(1, block_size, n_embd))
+        self.tok_emb = nn.Embedding(vocab_size, embedding_dim)
+        self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
         self.drop = nn.Dropout(embd_pdrop)
         # deep transformer: just a sequence of transformer blocks
-        self.blocks = nn.Sequential(*[Block(n_embd, block_size, n_head, attn_pdrop, resid_pdrop) for _ in range(n_layer)])
+        self.blocks, _, out_dims = self.init_blocks(attn_pdrop, block_size, embedding_dim, n_head, n_layer, resid_pdrop)
+        out_embedding_dim = out_dims[-1]
+
         # decoder: at the end one more layernorm and decode the answers
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.logit_p_head = nn.Linear(n_embd, vocab_size, bias=False)  # no need for extra bias due to one in ln_f
-        self.deviation_head = nn.Linear(n_embd, vocab_size, bias=False)  # mean deviation
+        self.ln_f = nn.LayerNorm(out_embedding_dim)
+        self.logit_p_head = nn.Linear(out_embedding_dim, vocab_size, bias=False) # no need for extra bias due to one in ln_f
+        self.deviation_head = nn.Linear(out_embedding_dim, vocab_size, bias=False)   # mean deviation
 
         self.block_size = block_size
         self.apply(self._init_weights)
@@ -134,8 +145,34 @@ class GPT(pl.LightningModule):
         self.iter = 0
         self.trajectory_counts: Dict[Tuple[int], int] = defaultdict(int)
         self.max_trajectory_count = 0
+        self.input_embed = input_embed
 
-        logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
+        log.info("number of parameters: %e" % sum(p.numel() for p in self.parameters()))
+
+    def init_blocks(self, attn_pdrop, block_size, embedding_dim, n_head, n_layer, resid_pdrop):
+        """
+        Here we allow different in/out neuron counts in each transformer layer aka block. Transformers usually
+        keep the same number of neurons at every layer, but a la Perceiver IO, these types of things can be changed
+        like any MLP. This was originally motivated here by OOM where reducing the output of the first layer
+        reduces the amount of memory used in all subsequent layers that use the reduced layer width.
+        """
+        blocks = []
+        approx_scale = [0.25] + [1] * (n_layer - 1)  # TODO: Allow passing this in
+        assert len(approx_scale) == n_layer
+        out_dims = []
+        for l_i in range(n_layer):
+            embedding_dim = self.make_divisible_by_heads(embedding_dim, n_head)
+            out_embedding_dim = self.make_divisible_by_heads(int(approx_scale[l_i] * embedding_dim), n_head)
+            blocks.append(Block(embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop, out_embedding_dim))
+            embedding_dim = out_embedding_dim
+            out_dims.append(out_embedding_dim)
+        return nn.Sequential(*blocks), approx_scale, out_dims
+
+    def make_divisible_by_heads(self, embedding_dim, n_head):
+        if embedding_dim % n_head != 0:
+            # Make embedding dim divisible by number of heads
+            embedding_dim -= embedding_dim % n_head
+        return embedding_dim
 
     def get_block_size(self):
         return self.block_size
@@ -198,6 +235,7 @@ class GPT(pl.LightningModule):
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
         optimizer = torch.optim.AdamW(optim_groups, lr=self.learning_rate, betas=self.betas)
+        self.optimizer = optimizer
         return optimizer
 
     def forward(self, idx):
@@ -228,6 +266,7 @@ class GPT(pl.LightningModule):
         idx, targets = batch
         logits, expected_deviation = self(idx)
 
+        # Calculate mean deviation loss --------------------------------------
         # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
         one_hot = F.one_hot(targets, num_classes=self.vocab_size)
         probs = F.softmax(logits, dim=-1)
@@ -236,10 +275,11 @@ class GPT(pl.LightningModule):
         d_diff = p_diff - expected_deviation
         d_loss = d_diff.square().sum() / d_diff.numel()
 
+        # Calculate standard transformer categorical probability loss-----------
+        # pytorch cross entropy has built-in softmax so pass logits
         p_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
         loss = d_loss + p_loss
-
+        self.iter += 1
         return {'loss': loss}
 
     def training_step(self, *args, **kwargs):
